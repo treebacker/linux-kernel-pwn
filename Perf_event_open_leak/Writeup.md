@@ -445,7 +445,7 @@ struct{
 
 [KALSE AND PERF](https://blog.lizzie.io/kaslr-and-perf.html)
 
-[man]()
+[man](https://man7.org/linux/man-pages/man2/perf_event_open.2.html)
 
 Documentation/admin-guide/perf-security.rst
 
